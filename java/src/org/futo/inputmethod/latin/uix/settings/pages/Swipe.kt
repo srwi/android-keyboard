@@ -25,6 +25,7 @@ import androidx.compose.ui.Alignment.Companion.Center
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
@@ -48,12 +49,14 @@ import org.futo.inputmethod.latin.uix.settings.NavigationItemStyle
 import org.futo.inputmethod.latin.uix.settings.ScreenTitle
 import org.futo.inputmethod.latin.uix.settings.ScrollableList
 import org.futo.inputmethod.latin.uix.settings.SettingRadio
+import org.futo.inputmethod.latin.uix.settings.SettingSliderSharedPrefsInt
 import org.futo.inputmethod.latin.uix.settings.SettingToggleDataStore
 import org.futo.inputmethod.latin.uix.settings.SettingToggleRaw
 import org.futo.inputmethod.latin.uix.settings.UserSetting
 import org.futo.inputmethod.latin.uix.settings.UserSettingsMenu
 import org.futo.inputmethod.latin.uix.settings.useDataStore
 import org.futo.inputmethod.latin.uix.settings.useDataStoreValue
+import org.futo.inputmethod.latin.uix.settings.useSharedPrefsBool
 import org.futo.inputmethod.latin.uix.settings.userSettingDecorationOnly
 import org.futo.inputmethod.latin.uix.settings.userSettingNavigationItem
 import org.futo.inputmethod.latin.uix.settings.userSettingToggleSharedPrefs
@@ -62,6 +65,7 @@ import org.futo.inputmethod.latin.uix.suggestionStylePrimary
 import org.futo.inputmethod.updates.openURI
 import org.futo.inputmethod.v2keyboard.LayoutManager
 import java.util.Locale
+import kotlin.math.roundToInt
 
 
 @Composable
@@ -231,6 +235,47 @@ val SwipeMenu = UserSettingsMenu(
             key = Settings.PREF_GESTURE_INPUT_SENSITIVITY,
             default = {false},
         ),
+
+        userSettingToggleSharedPrefs(
+            title = R.string.swipe_settings_word_combine,
+            subtitle = R.string.swipe_settings_word_combine_subtitle,
+            key = Settings.PREF_WORD_COMBINE,
+            default = {false},
+        ),
+
+        userSettingToggleSharedPrefs(
+            title = R.string.swipe_settings_word_auto_space,
+            subtitle = R.string.swipe_settings_word_auto_space_subtitle,
+            key = Settings.PREF_WORD_AUTO_SPACE,
+            default = {false},
+        ).copy(
+            visibilityCheck = {
+                useSharedPrefsBool(Settings.PREF_WORD_COMBINE, false).value
+            },
+            appearInSearchIfVisibilityCheckFailed = false
+        ),
+
+        UserSetting(
+            name = R.string.swipe_settings_word_auto_space_delay,
+            subtitle = R.string.swipe_settings_word_auto_space_delay_subtitle,
+            visibilityCheck = {
+                useSharedPrefsBool(Settings.PREF_WORD_COMBINE, false).value
+                        && useSharedPrefsBool(Settings.PREF_WORD_AUTO_SPACE, false).value
+            },
+            appearInSearchIfVisibilityCheckFailed = false,
+        ) {
+            val resources = LocalResources.current
+            SettingSliderSharedPrefsInt(
+                title = stringResource(R.string.swipe_settings_word_auto_space_delay),
+                key = Settings.PREF_WORD_INPUT_GAP,
+                default = Settings.DEFAULT_WORD_INPUT_GAP,
+                range = Settings.MIN_WORD_INPUT_GAP.toFloat()..Settings.MAX_WORD_INPUT_GAP.toFloat(),
+                hardRange = Settings.MIN_WORD_INPUT_GAP.toFloat()..Settings.MAX_WORD_INPUT_GAP.toFloat(),
+                transform = { it.roundToInt() },
+                indicator = { resources.getString(R.string.abbreviation_unit_milliseconds, "$it") },
+                steps = 48
+            )
+        },
 
         // KASROZ is primarily for English and the menu isn't translated, so it's hidden if user
         // doesn't have English layout

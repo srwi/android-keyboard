@@ -22,6 +22,7 @@ import org.futo.inputmethod.latin.common.Constants;
 import org.futo.inputmethod.latin.common.InputPointers;
 import org.futo.inputmethod.latin.common.ResizableIntArray;
 import org.futo.inputmethod.latin.settings.Settings;
+import org.futo.inputmethod.latin.settings.SettingsValues;
 
 /**
  * This class holds event points to recognize a gesture stroke.
@@ -148,7 +149,18 @@ public final class GestureStrokeRecognitionPoints {
 
     // TODO: Make this package private
     public final boolean isStartOfAGesture() {
-        boolean increaseSensitivity = Settings.getInstance().getCurrent().mGestureInputSensitive;
+        final SettingsValues settingsValues = Settings.getInstance().getCurrent();
+        boolean increaseSensitivity = settingsValues.mGestureInputSensitive;
+        // Auto-space / word-window mode: a swipe may start right after a letter tap to extend the
+        // same word. Right after a tap (mAfterFastTyping) the dynamic thresholds are elevated — the
+        // distance threshold can reach ~6 key widths — which would reject a short swipe like "ol"
+        // that begins just after the 't' tap. Relax both the time and distance checks down to their
+        // minimum values so a quick swipe-after-tap still registers. The relax is gated on
+        // mAfterFastTyping so it only affects swipes that actually follow a tap: outside the
+        // fast-typing window the dynamic thresholds are already at their minimums, so this is a
+        // no-op there. The fast-move speed check (hasDetectedFastMove) still requires real
+        // movement, so a tap alone can never become a swipe.
+        final boolean relaxGestureThresholds = settingsValues.mWordInputGap > 0 && mAfterFastTyping;
         if (!hasDetectedFastMove()) {
             return false;
         }
@@ -171,13 +183,21 @@ public final class GestureStrokeRecognitionPoints {
         int distanceThreshold = getGestureDynamicDistanceThreshold(deltaTime);
         int timeThreshold = getGestureDynamicTimeThreshold(deltaTime);
 
+        // Auto-space / word-window mode: drop both thresholds to their minimum values so a swipe
+        // starting right after a tap is recognized even when the post-fast-typing dynamic
+        // thresholds are still elevated.
+        if (relaxGestureThresholds) {
+            distanceThreshold = mGestureDynamicDistanceThresholdTo;
+            timeThreshold = mRecognitionParams.mDynamicTimeThresholdTo;
+        }
+
         // And reducing thresholds by 2x
         if(increaseSensitivity) {
             distanceThreshold /= 2;
             timeThreshold /= 2;
         }
 
-        final boolean isStartOfAGesture = deltaTime >= timeThreshold
+        final boolean isStartOfAGesture = (relaxGestureThresholds || deltaTime >= timeThreshold)
                 && deltaDistance >= distanceThreshold;
         if (DEBUG) {
             Log.d(TAG, String.format("[%d] isStartOfAGesture: dT=%3d tT=%3d dD=%3d tD=%3d%s%s",

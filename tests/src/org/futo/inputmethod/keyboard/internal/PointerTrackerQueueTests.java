@@ -36,6 +36,7 @@ public class PointerTrackerQueueTests {
         public final int mId;
         public boolean mIsModifier;
         public boolean mIsInDraggingFinger;
+        public boolean mIsGestureCapable = true;
         public long mPhantomUpEventTime = NOT_HAPPENED;
 
         public Element(int id) {
@@ -45,6 +46,11 @@ public class PointerTrackerQueueTests {
         @Override
         public boolean isModifier() {
             return mIsModifier;
+        }
+
+        @Override
+        public boolean isGestureCapable() {
+            return mIsGestureCapable;
         }
 
         @Override

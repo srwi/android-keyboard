@@ -157,6 +157,19 @@ public final class Settings implements SharedPreferences.OnSharedPreferenceChang
 
     public static final int DEFAULT_ALT_SPACES_MODE = SPACES_MODE_ALL;
 
+    // Auto-space / word-window mode. PREF_WORD_COMBINE accumulates inputs into one word until a
+    // manual commit (space/separator). PREF_WORD_AUTO_SPACE additionally auto-commits the word
+    // once the PREF_WORD_INPUT_GAP delay passes; when only combine is on, the gap value is
+    // ignored and the word never auto-commits. Both off restores stock behavior.
+    public static final String PREF_WORD_INPUT_GAP = "pref_word_input_gap";
+    public static final int MIN_WORD_INPUT_GAP = 10;
+    public static final int MAX_WORD_INPUT_GAP = 500;
+    public static final int DEFAULT_WORD_INPUT_GAP = 150;
+    public static final String PREF_WORD_COMBINE = "pref_word_combine";
+    public static final boolean DEFAULT_WORD_COMBINE = false;
+    public static final String PREF_WORD_AUTO_SPACE = "pref_word_auto_space";
+    public static final boolean DEFAULT_WORD_AUTO_SPACE = false;
+
     // Emoji
     public static final String PREF_EMOJI_RECENT_KEYS = "emoji_recent_keys";
     public static final String PREF_EMOJI_CATEGORY_LAST_TYPED_ID = "emoji_category_last_typed_id";

@@ -545,6 +545,15 @@
     <string name="swipe_settings_sensitive_swipe">Increase sensitivity</string>
     <string name="swipe_settings_sensitive_swipe_subtitle">Make swipe trigger more often</string>
 
+    <string name="swipe_settings_word_combine">Combine words</string>
+    <string name="swipe_settings_word_combine_subtitle">Keep taps and swipes in the same word until you commit it yourself (e.g. with space).</string>
+
+    <string name="swipe_settings_word_auto_space">Auto space</string>
+    <string name="swipe_settings_word_auto_space_subtitle">Automatically commit a combined word once the delay below has passed.</string>
+
+    <string name="swipe_settings_word_auto_space_delay">Auto-space delay</string>
+    <string name="swipe_settings_word_auto_space_delay_subtitle">Commit the word when the next input starts after this time.</string>
+
     <string name="swipe_settings_kasroz">KASROZ</string>
     <string name="swipe_settings_kasroz_subtitle">The best keyboard layout to swipe</string>
 

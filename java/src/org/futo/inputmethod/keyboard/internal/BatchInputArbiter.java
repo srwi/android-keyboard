@@ -34,7 +34,9 @@ public class BatchInputArbiter {
         public void onEndBatchInput(final InputPointers aggregatedPointers, final long upEventTime);
     }
 
-    // The starting time of the first stroke of a gesture input.
+    /**
+     * The starting time of the first stroke of a gesture input.
+     */
     private static long sGestureFirstDownTime = -1;
     // The {@link InputPointers} that includes all events of a gesture input.
     private static final InputPointers sAggregatedPointers = new InputPointers(
@@ -61,6 +63,30 @@ public class BatchInputArbiter {
      */
     public int getElapsedTimeSinceFirstDown(final long eventTime) {
         return (int)(eventTime - sGestureFirstDownTime);
+    }
+
+    /**
+     * The uptime (ms) of the current gesture's first pointer-down event, or -1 if no gesture is in
+     * progress. Used by the word-window feature to measure the combine-gap from the previous
+     * input's end to the moment the next swipe actually starts (its first down), rather than to the
+     * later gesture-detection point.
+     */
+    public static long getGestureFirstDownTime() {
+        synchronized (sAggregatedPointers) {
+            return sGestureFirstDownTime;
+        }
+    }
+
+    /**
+     * Clear the gesture-start marker. Called after a standalone tap (a code input that was not part
+     * of a gesture batch) so the NEXT swipe's first down event re-arms it fresh — otherwise it
+     * would keep this tap's down time and the word-window combine-gap check would measure a stale,
+     * even negative, elapsed gap. Must not be called while a batch input is in progress.
+     */
+    public static void resetGestureFirstDownTime() {
+        synchronized (sAggregatedPointers) {
+            sGestureFirstDownTime = -1;
+        }
     }
 
     /**

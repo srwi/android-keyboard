@@ -228,6 +228,10 @@ public final class PointerTracker implements PointerTrackerQueue.Element,
         return sPointerTrackerQueue.isAnyInDraggingFinger();
     }
 
+    public static boolean hasActiveGesturePointer() {
+        return sPointerTrackerQueue.hasGestureCapablePointer();
+    }
+
     public static void cancelAllPointerTrackers() {
         sPointerTrackerQueue.cancelAllPointerTrackers();
     }
@@ -407,6 +411,11 @@ public final class PointerTracker implements PointerTrackerQueue.Element,
     @Override
     public boolean isModifier() {
         return mCurrentKey != null && mCurrentKey.isModifier();
+    }
+
+    @Override
+    public boolean isGestureCapable() {
+        return mIsDetectingGesture;
     }
 
     public Key getKeyOn(final int x, final int y) {

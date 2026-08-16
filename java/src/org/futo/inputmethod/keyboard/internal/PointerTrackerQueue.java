@@ -29,6 +29,13 @@ public final class PointerTrackerQueue {
         public boolean isInDraggingFinger();
         public void onPhantomUpEvent(long eventTime);
         public void cancelTrackingForAction();
+        /**
+         * Whether this pointer is still able to become a gesture (it was pressed on a letter key
+         * on the alphabet keyboard and has not been released). A gesture-capable pointer must not
+         * be phantom-released when a newer pointer lifts, otherwise a held finger that is about to
+         * swipe (e.g. hold "w", tap "i", slide "w" to "r") would be killed by the tap.
+         */
+        public boolean isGestureCapable();
     }
 
     private static final int INITIAL_CAPACITY = 10;
@@ -105,7 +112,7 @@ public final class PointerTrackerQueue {
                 if (element == pointer) {
                     break; // Stop releasing elements.
                 }
-                if (!element.isModifier()) {
+                if (!element.isModifier() && !element.isGestureCapable()) {
                     element.onPhantomUpEvent(eventTime);
                     continue; // Remove this element from the expandableArray.
                 }
@@ -198,6 +205,19 @@ public final class PointerTrackerQueue {
             for (int index = 0; index < arraySize; index++) {
                 final Element element = expandableArray.get(index);
                 if (element.isInDraggingFinger()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    public boolean hasGestureCapablePointer() {
+        synchronized (mExpandableArrayOfActivePointers) {
+            final ArrayList<Element> expandableArray = mExpandableArrayOfActivePointers;
+            final int arraySize = mArraySize;
+            for (int index = 0; index < arraySize; index++) {
+                if (expandableArray.get(index).isGestureCapable()) {
                     return true;
                 }
             }

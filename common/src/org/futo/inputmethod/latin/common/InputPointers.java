@@ -168,6 +168,21 @@ public final class InputPointers {
     }
 
     /**
+     * Convenience for appending one complete {@link GestureSegment} worth of points: opens a
+     * segment for {@code pointerId}, appends the supplied points to both the flat arrays and the
+     * segment, then marks the pointer up. Used by the word-window feature to synthesize tap
+     * micro-swipes and to copy a completed swipe's segments into the accumulated window pointers.
+     * Each call opens a fresh segment (even for a repeated {@code pointerId}), so successive
+     * inputs stay as distinct segments.
+     */
+    public void appendGestureSegment(final int pointerId, final ResizableIntArray xs,
+            final ResizableIntArray ys, final ResizableIntArray t) {
+        onPointerDown(pointerId);
+        append(pointerId, t, xs, ys, 0, xs.getLength());
+        onPointerUp(pointerId);
+    }
+
+    /**
      * Shift to the left by elementCount, discarding elementCount pointers at the start.
      * @param elementCount how many elements to shift.
      */

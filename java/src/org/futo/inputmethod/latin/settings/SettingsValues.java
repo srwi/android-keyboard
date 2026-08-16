@@ -112,6 +112,11 @@ public class SettingsValues {
     public final int mBackspaceModeHold;
     public final int mNumberRowMode;
     public final int mAltSpacesMode;
+    // Auto-space / word-window mode: the effective combine gap in ms. 0 = feature off; a large
+    // value (Integer.MAX_VALUE) means combine-until-manually-committed with no auto-space timeout.
+    // Derived from Settings.PREF_WORD_COMBINE + Settings.PREF_WORD_INPUT_GAP. Consumed
+    // synchronously by InputLogic/PointerTracker.
+    public final int mWordInputGap;
 
     public final List<Locale> mMultilingualLocales;
 
@@ -216,6 +221,23 @@ public class SettingsValues {
                 prefs.getInt(Settings.PREF_NUMBER_ROW_MODE, Settings.NUMBER_ROW_MODE_DEFAULT)
                 : Settings.NUMBER_ROW_MODE_DEFAULT;
         mAltSpacesMode = inputAttributes.mIsEmailField ? Settings.SPACES_MODE_NONE : prefs.getInt(Settings.PREF_ALT_SPACES_MODE, Settings.DEFAULT_ALT_SPACES_MODE);
+        // Auto-space / word-window mode. The effective combine gap (ms) combines the two toggles;
+        // auto-space only takes effect when combine is on (it depends on the word window):
+        //   combine + auto-space -> the literal delay, clamped to >= MIN_WORD_INPUT_GAP
+        //   combine only         -> MAX_VALUE (manual commit only: inputs accumulate until
+        //                           space/separator; never auto-commit on silence)
+        //   neither              -> 0 (feature off, stock behavior)
+        final boolean wordCombine =
+                prefs.getBoolean(Settings.PREF_WORD_COMBINE, Settings.DEFAULT_WORD_COMBINE);
+        final boolean wordAutoSpace =
+                prefs.getBoolean(Settings.PREF_WORD_AUTO_SPACE, Settings.DEFAULT_WORD_AUTO_SPACE);
+        final int wordAutoSpaceDelay =
+                prefs.getInt(Settings.PREF_WORD_INPUT_GAP, Settings.DEFAULT_WORD_INPUT_GAP);
+        mWordInputGap = wordCombine
+                ? (wordAutoSpace
+                        ? Math.max(wordAutoSpaceDelay, Settings.MIN_WORD_INPUT_GAP)
+                        : Integer.MAX_VALUE)
+                : 0;
 
         mShouldShowLxxSuggestionUi = Settings.SHOULD_SHOW_LXX_SUGGESTION_UI
                 && prefs.getBoolean(DebugSettings.PREF_SHOULD_SHOW_LXX_SUGGESTION_UI, true);
@@ -584,6 +606,8 @@ public class SettingsValues {
         sb.append("" + mNumberRowMode);
         sb.append("\n   mAltSpacesMode = ");
         sb.append("" + mAltSpacesMode);
+        sb.append("\n   mWordInputGap = ");
+        sb.append("" + mWordInputGap);
         sb.append("\n   mPlausibilityThreshold = ");
         sb.append("" + mPlausibilityThreshold);
         sb.append("\n   mAutoCorrectionEnabledPerTextFieldSettings = ");

@@ -34,6 +34,8 @@ import org.futo.inputmethod.event.Event;
 import org.futo.inputmethod.event.InputTransaction;
 import org.futo.inputmethod.keyboard.Keyboard;
 import org.futo.inputmethod.keyboard.KeyboardSwitcher;
+import org.futo.inputmethod.keyboard.PointerTracker;
+import org.futo.inputmethod.keyboard.internal.BatchInputArbiter;
 import org.futo.inputmethod.latin.BinaryDictionary;
 import org.futo.inputmethod.latin.DictionaryFacilitator;
 import org.futo.inputmethod.latin.LastComposedWord;
@@ -46,6 +48,7 @@ import org.futo.inputmethod.latin.SuggestedWords.SuggestedWordInfo;
 import org.futo.inputmethod.latin.WordComposer;
 import org.futo.inputmethod.latin.common.Constants;
 import org.futo.inputmethod.latin.common.InputPointers;
+import org.futo.inputmethod.latin.common.ResizableIntArray;
 import org.futo.inputmethod.latin.common.StringUtils;
 import org.futo.inputmethod.latin.define.DebugFlags;
 import org.futo.inputmethod.latin.settings.Settings;
@@ -64,6 +67,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Locale;
+import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
@@ -115,6 +119,39 @@ public final class InputLogic {
     public final WordComposer mWordComposer;
     public final RichInputConnection mConnection;
     private final RecapitalizeStatus mRecapitalizeStatus = new RecapitalizeStatus();
+
+    // Auto-space / word-window mode.
+    // Inert when mCurrentSettingsValues.mWordInputGap == 0 (stock behavior). When > 0, the
+    // arbiter decides whether each new input (tap or swipe) extends the current word-window,
+    // commits the pending one lazily before starting a new one, or starts fresh. See
+    // {@link WordWindowArbiter} for the decision rules.
+    final WordWindowArbiter mWordWindowArbiter = new WordWindowArbiter();
+
+    // Accumulated pointer path for the currently open word-window, when window-decoded mode is
+    // active (i.e. {@link WordWindowArbiter#windowHasSwipe()} is true). Contains micro-swipe
+    // segments synthesized from taps plus the {@link GestureSegment}s of every swipe in the
+    // window, each as its own segment. The whole accumulated path is re-decoded as one word
+    // through the existing ML swipe decoder. Kept separate
+    // from {@code BatchInputArbiter.sAggregatedPointers} so the stock multi-finger batch
+    // lifecycle is untouched (gap == 0 ⇒ byte-identical to stock).
+    private final InputPointers mWindowPointers = new InputPointers(Constants.DEFAULT_GESTURE_POINTS_CAPACITY);
+    // True while an extending swipe (gap-mode EXTEND) is in progress, so {@link #onUpdateBatchInput}
+    // can suppress the stock live update and leave the prefix's composing text intact until the
+    // combined window is decoded on finger-up. Cleared in {@link #onEndBatchInput}.
+    private boolean mWindowExtendingSwipe = false;
+    // End time (ms, window-relative) of the accumulated window trajectory. Every appended input's
+    // timestamps are rebased to continue from here so the ML decoder reads the whole window as one
+    // continuous stroke (a time jump between swipes/taps would be read as a spurious fast move).
+    private long mWindowEndTimeMs = 0;
+
+    // Micro-swipe synthesis parameters for taps entering a window-decoded word. A short stationary
+    // cluster of advancing-time points at the tapped key center so the ML decoder sees a brief
+    // stroke rather than a single degenerate point.
+    private static final int TAP_MICRO_SWIPE_POINTS = 5;
+    private static final int TAP_MICRO_SWIPE_DT_MS = 30;
+    // Small time bridge inserted between consecutive window inputs so the model sees a fast glide
+    // (like a real single stroke's quick move between letters) instead of a zero-time teleport.
+    private static final int WINDOW_BRIDGE_MS = 16;
 
     private int mDeleteCount;
     private long mLastKeyTime;
@@ -460,6 +497,9 @@ public final class InputLogic {
 
             mConnection.finishComposingText();
             mWordComposer.reset(true);
+            // Undo pick abandons the current composition without commitChosenWord: close the
+            // word-window so the next input starts fresh.
+            closeWordWindow();
 
             mConnection.commitText(suggestionInfo.mWord, 1);
 
@@ -645,6 +685,64 @@ public final class InputLogic {
             final int currentKeyboardScriptId) {
         mWordBeingCorrectedByCursor = null;
 
+        // Auto-space / word-window mode. For word code points only
+        // (separators/functional keys go through the normal commit path which closes
+        // the window via resetComposingState).
+        final int gap = settingsValues.mWordInputGap;
+        // A code input (tap) is not part of a gesture batch, so clear the leftover
+        // gesture-start marker: the next swipe's first down must re-arm it fresh, otherwise the
+        // combine-gap check would measure against this tap's (earlier) down time and see a stale,
+        // even negative, elapsed gap. Guarded against an in-flight multi-touch batch.
+        if (gap > 0 && !mInputLogicHandler.isInBatchInput()
+                && !PointerTracker.hasActiveGesturePointer()) {
+            BatchInputArbiter.resetGestureFirstDownTime();
+        }
+        final boolean isWordTap = gap > 0
+                && event.mKeyCode != Constants.CODE_DELETE
+                && settingsValues.isWordCodePoint(event.mCodePoint);
+        if (isWordTap) {
+            final long now = SystemClock.uptimeMillis();
+            final WordWindowArbiter.Decision d = mWordWindowArbiter.onStartInput(gap, now, false);
+            if (d == WordWindowArbiter.Decision.COMMIT_THEN_START) {
+                // Gap exceeded: the pending window word commits lazily on this, the next tap,
+                // with one space honoring auto-space mode, then this tap begins a fresh word the
+                // stock way.
+                commitPendingWindowAndStartFreshTap(settingsValues);
+                // Fall through: stock path will start composing with this tap as the first letter.
+            } else if (d == WordWindowArbiter.Decision.EXTEND
+                    && mWordWindowArbiter.windowHasSwipe()) {
+                // Window already contains a swipe ⇒ this tap extends it as a micro-swipe segment:
+                // the whole accumulated path re-decodes as one word. Do NOT append a letter; the
+                // composing text comes from the ML decoder.
+                final int x = event.mX;
+                final int y = event.mY;
+                if (x != Constants.NOT_A_COORDINATE && y != Constants.NOT_A_COORDINATE) {
+                    appendTapMicroSwipeToWindow(x, y);
+                    triggerWindowRedecode();
+                    mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */);
+                    final InputTransaction it = new InputTransaction(settingsValues, event, now,
+                            mSpaceState, getActualCapsMode(settingsValues, keyboardShiftMode));
+                    mLastKeyTime = now;
+                    // Note: deliberately NOT setRequiresUpdateSuggestions() — triggerWindowRedecode
+                    // already re-decodes the window via INPUT_STYLE_TAIL_BATCH; asking GeneralIME to
+                    // also run a TYPING update would cancel/race that re-decode.
+                    it.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW);
+                    return it;
+                }
+                // No key coordinates (e.g. a hardware-keyboard letter): we cannot synthesize the
+                // tap into the window as a micro-swipe, and appending it to the batch-mode
+                // composer as a plain letter would corrupt the decoded word. Commit the pending
+                // window word (with one space, honoring auto-space mode) and let this tap begin a
+                // fresh word the stock way.
+                commitPendingWindowAndStartFreshTap(settingsValues);
+            } else {
+                // START_FRESH or pure-tap EXTEND: stock path handles the tap (letter append).
+                // Note: while the window is pure-tap, recordInputEnd is a no-op (the gap timer
+                // only arms once a swipe is part of the word), so slow taps never commit.
+                mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */);
+            }
+        }
+
         if(settingsValues.needsToLookupSuggestions()) {
             synchronized (mLastEvents) {
                 if (mLastEvents.size() >= 8) mLastEvents.removeFirst();
@@ -672,6 +770,12 @@ public final class InputLogic {
         }
 
         mLastKeyTime = inputTransaction.mTimestamp;
+        // Record the gap-window's input-end reference for the stock fall-through tap path (the
+        // gap-aware early branch above records its own). Only meaningful when gap > 0; no-op for
+        // pure-tap windows (the timer only arms once a swipe is part of the word).
+        if (gap > 0) {
+            mWordWindowArbiter.recordInputEnd(inputTransaction.mTimestamp, false /* isSwipe */);
+        }
         mConnection.beginBatchEdit();
         if (!mWordComposer.isComposingWord()) {
             // TODO: is this useful? It doesn't look like it should be done here, but rather after
@@ -748,6 +852,221 @@ public final class InputLogic {
         mImeHelper.updateBoostedCodePoints(boostedCodePoints);
     }
 
+    // ---- Auto-space / word-window mode helpers ----
+
+    private void resetWindowPointers() {
+        mWindowPointers.reset();
+        mWindowEndTimeMs = 0;
+    }
+
+    /**
+     * Close the word-window: the arbiter forgets the pending window, the accumulated pointer path
+     * is cleared, and any in-flight extending-swipe suppression is dropped. Called on every normal
+     * commit (space/separator/manual pick) and whenever the composing state is reset, so the next
+     * input always starts a fresh window instead of extending the just-committed one.
+     */
+    private void closeWordWindow() {
+        if (!mWordWindowArbiter.isWindowOpen() && mWindowPointers.getPointerSize() == 0) {
+            return;
+        }
+        mWordWindowArbiter.onWindowReset();
+        resetWindowPointers();
+        mWindowExtendingSwipe = false;
+    }
+
+    /**
+     * Commit the pending window word (it commits lazily on the next input) with exactly one space
+     * honoring the user's auto-space mode, then re-open the window with the current tap as its
+     * first unit and fall through to the stock path so the tap starts a fresh word. Used by
+     * {@code onCodeInput} for the {@link WordWindowArbiter.Decision#COMMIT_THEN_START} decision
+     * and for the EXTEND-tap case where the tap carries no key coordinates (it cannot be
+     * synthesized into the window as a micro-swipe, so the pending word must be committed instead
+     * of being corrupted by a plain letter append).
+     */
+    private void commitPendingWindowAndStartFreshTap(final SettingsValues settingsValues) {
+        mConnection.beginBatchEdit();
+        // If the user moved the cursor into the middle of the pending window word to correct it,
+        // do NOT commit the whole word: that would drop the cursor at the wrong spot and insert a
+        // space into the middle of the correction. Mirror the swipe COMMIT_THEN_START path and
+        // unlearn + reset the entire input state instead, so this tap starts fresh at the cursor.
+        final boolean midWordCorrection = mWordComposer.isComposingWord()
+                && mWordComposer.isCursorFrontOrMiddleOfComposingWord();
+        if (midWordCorrection) {
+            unlearnWord(mWordComposer.getTypedWord(), settingsValues,
+                    Constants.EVENT_BACKSPACE);
+            resetEntireInputState(mConnection.getExpectedSelectionStart(),
+                    mConnection.getExpectedSelectionEnd(), true /* clearSuggestionStrip */);
+        } else if (mWordComposer.isComposingWord()) {
+            // Whether the pending window was pure-tap (letters in the composer) or
+            // window-decoded (batch mode with the decoded word set as the typed word in
+            // onUpdateTailBatchInputCompleted), commitCurrentAutoCorrection routes through
+            // commitChosenWord, which populates mLastComposedWord (backspace-to-revert and n-gram
+            // history work like any other committed word) and closes the word-window.
+            commitCurrentAutoCorrection(settingsValues, LastComposedWord.NOT_A_SEPARATOR);
+        }
+        resetComposingState(false /* alsoResetLastComposedWord */);
+        mWordWindowArbiter.restartWindowForNewInput();
+        // No auto-space after a mid-word correction reset: the cursor is inside a word, so a space
+        // would land in the middle of the correction.
+        if (!midWordCorrection && settingsValues.mAltSpacesMode != Settings.SPACES_MODE_NONE) {
+            insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues);
+        }
+        // The manual auto-space above is the ONLY separator between the committed window word and
+        // this new tap's first letter. The fall-through stock path snapshots mSpaceState into the
+        // new InputTransaction; if it were left as PHANTOM (e.g. the window began with a swipe,
+        // which sets PHANTOM), the stock path would insert a second space. NONE guarantees exactly
+        // one space.
+        mSpaceState = SpaceState.NONE;
+        mConnection.endBatchEdit();
+    }
+
+    /**
+     * Synthesize a single tap as a short stationary micro-swipe segment at the tapped key center
+     * and append it to {@link #mWindowPointers}. Used when a tap extends a window that already
+     * contains a swipe (taps within a swipe-word decode together as one unit).
+     *
+     * <p>The tap segment uses pointerId 0 (it is part of the same single-hand stroke as the swipes
+     * it extends) and its timestamps are rebased onto the window's continuous timeline
+     * (see {@link #mWindowEndTimeMs}).
+     */
+    private void appendTapMicroSwipeToWindow(final int x, final int y) {
+        final long base = mWindowEndTimeMs == 0 ? 0 : mWindowEndTimeMs + WINDOW_BRIDGE_MS;
+        final ResizableIntArray xs = new ResizableIntArray(TAP_MICRO_SWIPE_POINTS);
+        final ResizableIntArray ys = new ResizableIntArray(TAP_MICRO_SWIPE_POINTS);
+        final ResizableIntArray ts = new ResizableIntArray(TAP_MICRO_SWIPE_POINTS);
+        for (int i = 0; i < TAP_MICRO_SWIPE_POINTS; i++) {
+            xs.add(x);
+            ys.add(y);
+            ts.add((int) (base + i * TAP_MICRO_SWIPE_DT_MS));
+        }
+        mWindowPointers.appendGestureSegment(0, xs, ys, ts);
+        mWindowEndTimeMs = base + (TAP_MICRO_SWIPE_POINTS - 1) * TAP_MICRO_SWIPE_DT_MS;
+    }
+
+    /**
+     * Copy each {@link InputPointers.GestureSegment} of a just-completed swipe into
+     * {@link #mWindowPointers} so successive swipes stay as distinct segments.
+     *
+     * <p>The original {@code pointerId}s are preserved: the ML decoder
+     * ({@code SwipeDecoderDictionary}) partitions a multi-segment path into left/right hands by
+     * pointerId 0 vs 1, so a real simultaneous two-thumb swipe (two segments, ids 0 and 1 in one
+     * batch) must keep its ids or the whole path collapses into one hand and decodes to garbage.
+     * Tap micro-swipes (synthesized with id 0) interleave with the single-hand strokes they extend.
+     * A fresh synthetic id (e.g. 1000+) must NOT be used — the decoder drops ids other than 0/1.
+     *
+     * <p>All timestamps are rebased onto the window's continuous timeline
+     * (see {@link #mWindowEndTimeMs}); the batch's own times are relative to its first gesture
+     * down, and successive batches must continue where the window left off.
+     *
+     * <p>Also accepts flat-array-only pointers (as {@code InputTestsBase.gesture()} synthesizes
+     * in tests, which carries points but no gesture segments): in that case a single segment is
+     * synthesized from the flat arrays so window decoding works identically.
+     */
+    private void appendSwipeSegmentsToWindow(final InputPointers swipePointers) {
+        final List<InputPointers.GestureSegment> segments = swipePointers.getGestureSegments();
+        if (segments.isEmpty()) {
+            final int size = swipePointers.getPointerSize();
+            final int[] segXs = swipePointers.getXCoordinates();
+            final int[] segYs = swipePointers.getYCoordinates();
+            final int[] segTs = swipePointers.getTimes();
+            final long base = mWindowEndTimeMs == 0 ? 0 : mWindowEndTimeMs + WINDOW_BRIDGE_MS;
+            final ResizableIntArray xs = new ResizableIntArray(size);
+            final ResizableIntArray ys = new ResizableIntArray(size);
+            final ResizableIntArray ts = new ResizableIntArray(size);
+            long end = base;
+            for (int i = 0; i < size; i++) {
+                final long t = base + (segTs[i] - (segTs.length > 0 ? segTs[0] : 0));
+                xs.add(segXs[i]);
+                ys.add(segYs[i]);
+                ts.add((int) t);
+                end = t;
+            }
+            mWindowPointers.appendGestureSegment(0, xs, ys, ts);
+            mWindowEndTimeMs = end;
+            return;
+        }
+        // Batch times are relative to the batch's first gesture down: rebase the whole batch so
+        // its first point continues the window timeline, preserving the within-batch relative
+        // timing (which keeps simultaneous multi-thumb swipes overlapping correctly).
+        long batchBase = Long.MAX_VALUE;
+        for (final InputPointers.GestureSegment seg : segments) {
+            if (seg.t.getLength() > 0) {
+                batchBase = Math.min(batchBase, seg.t.get(0));
+            }
+        }
+        final long base = mWindowEndTimeMs == 0 ? 0 : mWindowEndTimeMs + WINDOW_BRIDGE_MS;
+        final long offset = batchBase == Long.MAX_VALUE ? base : base - batchBase;
+        long end = mWindowEndTimeMs;
+        for (final InputPointers.GestureSegment seg : segments) {
+            final int n = seg.x.getLength();
+            if (n == 0) {
+                continue;
+            }
+            final ResizableIntArray xs = new ResizableIntArray(n);
+            final ResizableIntArray ys = new ResizableIntArray(n);
+            final ResizableIntArray ts = new ResizableIntArray(n);
+            for (int i = 0; i < n; i++) {
+                xs.add(seg.x.get(i));
+                ys.add(seg.y.get(i));
+                final long t = seg.t.get(i) + offset;
+                ts.add((int) t);
+                end = Math.max(end, t);
+            }
+            mWindowPointers.appendGestureSegment(seg.pointerId, xs, ys, ts);
+        }
+        mWindowEndTimeMs = end;
+    }
+
+    /**
+     * Convert a pure-tap prefix (built the stock way in {@link #mWordComposer}) into micro-swipe
+     * segments in {@link #mWindowPointers}, then switch the composer to batch mode pointing at the
+     * window pointers. Called when a swipe extends a tap-word within the gap: the prefix's letters
+     * are read from the composer's typed word, and their key coordinates from the composer's tap
+     * pointer cache (populated by {@link WordComposer#applyProcessedEvent}).
+     *
+     * @return false if a prefix letter has no usable key coordinate (typed without a key, e.g. a
+     *     hardware-keyboard letter, or a composed character that produced more code points than
+     *     taps). Such a letter cannot be synthesized as a micro-swipe, and feeding
+     *     {@link Constants#NOT_A_COORDINATE} (-1,-1) points to the ML decoder would corrupt the
+     *     decode, so the caller must fall back to committing the pending word and decoding this
+     *     swipe alone (stock behavior). On failure nothing has been mutated.
+     */
+    private boolean convertTypedPrefixToWindowPointers() {
+        final String typed = mWordComposer.getTypedWord();
+        // The composer's flat coordinate arrays are indexed by code-point index (each tap appends
+        // one point at newIndex = size()), so iterate code points (not UTF-16 offsets) and guard
+        // against the used length (getPointerSize(), not the backing array's capacity).
+        final InputPointers composerPointers = mWordComposer.getInputPointers();
+        final int[] xs = composerPointers.getXCoordinates();
+        final int[] ys = composerPointers.getYCoordinates();
+        final int pointerSize = composerPointers.getPointerSize();
+        int codePointIndex = 0;
+        for (int i = 0; i < typed.length(); i = Character.offsetByCodePoints(typed, i, 1)) {
+            final int x = codePointIndex < pointerSize ? xs[codePointIndex]
+                    : Constants.NOT_A_COORDINATE;
+            final int y = codePointIndex < pointerSize ? ys[codePointIndex]
+                    : Constants.NOT_A_COORDINATE;
+            if (x == Constants.NOT_A_COORDINATE || y == Constants.NOT_A_COORDINATE) {
+                return false;
+            }
+            appendTapMicroSwipeToWindow(x, y);
+            codePointIndex++;
+        }
+        mWordComposer.reset(false /* alsoResetRejectedBatchSuggestion */);
+        mWordComposer.setBatchInputPointers(mWindowPointers);
+        return true;
+    }
+
+    /**
+     * Re-decode the whole accumulated window path as one word and set the result as composing,
+     * routed through the tail-batch path so {@link #onUpdateTailBatchInputCompleted} sets the
+     * composing text from the decoded word (not from {@link WordComposer#getTypedWord()}).
+     */
+    private void triggerWindowRedecode() {
+        mWordComposer.setBatchInputPointers(mWindowPointers);
+        postUpdateSuggestionStrip(SuggestedWords.INPUT_STYLE_TAIL_BATCH);
+    }
+
     public void onStartBatchInput(final SettingsValues settingsValues,
             final KeyboardSwitcher keyboardSwitcher) {
         mWordBeingCorrectedByCursor = null;
@@ -757,6 +1076,54 @@ public final class InputLogic {
         //handler.showGesturePreviewAndSuggestionStrip(
         //        SuggestedWords.getEmptyInstance(), false /* dismissGestureFloatingPreviewText */);
         //handler.cancelUpdateSuggestionStrip();
+
+        // Auto-space / word-window mode: decide what this swipe does relative to the open window.
+        if (settingsValues.mWordInputGap > 0) {
+            // Measure the gap from the previous input's end to THIS swipe's first finger-down
+            // (BatchInputArbiter.sGestureFirstDownTime), not to onStartBatchInput (which fires only
+            // after the gesture has travelled far enough to be detected — that would eat 100-200 ms
+            // of movement and reject a quick tap-then-swipe even when the user was within the gap).
+            final long swipeDownTime = BatchInputArbiter.getGestureFirstDownTime();
+            final long now = swipeDownTime > 0 ? swipeDownTime : SystemClock.uptimeMillis();
+            final WordWindowArbiter.Decision d =
+                    mWordWindowArbiter.onStartInput(settingsValues.mWordInputGap, now, true);
+            if (d == WordWindowArbiter.Decision.EXTEND) {
+                // This swipe extends the still-open window (the whole window decodes as one
+                // unit). Defer the prefix→micro-swipe conversion to onEndBatchInput so a
+                // cancelled swipe leaves the prefix composing intact.
+                mWindowExtendingSwipe = true;
+                // Do NOT commit the pending word, do NOT set a PHANTOM space (no space inside a
+                // word), and keep the window's start-time caps mode. Return without running the
+                // stock commit / PHANTOM / caps block below.
+                return;
+            }
+            if (d == WordWindowArbiter.Decision.COMMIT_THEN_START) {
+                // Gap exceeded: the pending window word commits lazily on this, the next input,
+                // with one space (honoring auto-space mode via the commit path), then this swipe
+                // begins a fresh window.
+                if (mWordComposer.isComposingWord()) {
+                    if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+                        unlearnWord(mWordComposer.getTypedWord(), settingsValues,
+                                Constants.EVENT_BACKSPACE);
+                        resetEntireInputState(mConnection.getExpectedSelectionStart(),
+                                mConnection.getExpectedSelectionEnd(), true /* clearSuggestionStrip */);
+                    } else {
+                        commitCurrentAutoCorrection(settingsValues,
+                                LastComposedWord.NOT_A_SEPARATOR);
+                    }
+                }
+                resetWindowPointers();
+                mWordWindowArbiter.restartWindowForNewInput();
+                // Fall through: the stock body sets PHANTOM space + caps for the fresh swipe,
+                // and its compose-commit block is a no-op (composer not composing right now).
+            } else { // START_FRESH: a brand new swipe window starts.
+                resetWindowPointers();
+                // Fall through to the stock body. The arbiter has opened the window (hasSwipe
+                // will flip once this swipe completes); the stock commit block still fires for a
+                // leftover non-window typed word (consistent with stock swipe-after-typed
+                // behavior).
+            }
+        }
 
         ++mAutoCommitSequenceNumber;
         mConnection.beginBatchEdit();
@@ -809,17 +1176,59 @@ public final class InputLogic {
      */
     private int mAutoCommitSequenceNumber = 1;
     public void onUpdateBatchInput(final InputPointers batchPointers) {
+        // In word-window EXTEND mode, suppress the stock live update: it would set the composing
+        // text to this swipe's word alone and drop the prefix (the prefix is part of the same
+        // word and is preserved in mWindowPointers until finger-up). The combined window is
+        // decoded on finger-up in onEndBatchInput.
+        if (mWindowExtendingSwipe) {
+            return;
+        }
         mInputLogicHandler.onUpdateBatchInput(batchPointers, mAutoCommitSequenceNumber);
     }
 
     public void onEndBatchInput(final InputPointers batchPointers) {
-        mInputLogicHandler.updateTailBatchInput(batchPointers, mAutoCommitSequenceNumber);
+        final SettingsValues settingsValues = Settings.getInstance().getCurrent();
+        if (settingsValues.mWordInputGap > 0 && mWordWindowArbiter.isWindowOpen()) {
+            // Window-decoded mode: append this swipe's segments to the accumulated window path.
+            // If the window was pure-tap so far (a tap prefix precedes this swipe), convert that
+            // prefix into micro-swipe segments first, so the whole path — taps + swipes — decodes
+            // together as one word. Routed via the tail-batch flow so the composing text is set to
+            // the combined window word (not the swipe alone).
+            if (mWordComposer.isComposingWord() && !mWordComposer.isBatchMode()
+                    && !convertTypedPrefixToWindowPointers()) {
+                // The tap prefix cannot be represented as micro-swipes (a letter was typed without
+                // key coordinates). Commit it as its own word (with a space, like a stock
+                // swipe-after-typed), then let THIS swipe start a fresh window decoded alone.
+                commitCurrentAutoCorrection(settingsValues, LastComposedWord.NOT_A_SEPARATOR);
+                resetWindowPointers();
+                mWordWindowArbiter.restartWindowForNewInput();
+                if (settingsValues.mAltSpacesMode != Settings.SPACES_MODE_NONE) {
+                    mSpaceState = SpaceState.PHANTOM;
+                }
+                appendSwipeSegmentsToWindow(batchPointers);
+                mWordComposer.setBatchInputPointers(mWindowPointers);
+                mInputLogicHandler.updateTailBatchInput(mWindowPointers, mAutoCommitSequenceNumber);
+            } else {
+                appendSwipeSegmentsToWindow(batchPointers);
+                mWordComposer.setBatchInputPointers(mWindowPointers);
+                mInputLogicHandler.updateTailBatchInput(mWindowPointers, mAutoCommitSequenceNumber);
+            }
+        } else {
+            mInputLogicHandler.updateTailBatchInput(batchPointers, mAutoCommitSequenceNumber);
+        }
+        mWindowExtendingSwipe = false;
+        mWordWindowArbiter.recordInputEnd(SystemClock.uptimeMillis(), true /* isSwipe */);
         ++mAutoCommitSequenceNumber;
     }
 
     public void onCancelBatchInput() {
         mInputLogicHandler.onCancelBatchInput();
         mIme.setNeutralSuggestionStrip();
+        // A cancelled swipe during a window-EXTEND leaves the prefix composing untouched
+        // (conversion was deferred to onEndBatchInput). Just clear the extending flag. The
+        // arbiter needs no revert: a cancelled swipe never calls recordInputEnd(isSwipe=true),
+        // so a pure-tap window stays pure-tap with no armed timer.
+        mWindowExtendingSwipe = false;
     }
 
     // TODO: on the long term, this method should become private, but it will be difficult.
@@ -1454,6 +1863,7 @@ public final class InputLogic {
                             Constants.EVENT_REJECTION);
                 }
                 StatsUtils.onBackspaceWordDelete(rejectedSuggestion.length());
+                closeWordWindow();
             } else if(deleteWholeWords) {
                 final String removedWord = mWordComposer.getTypedWord();
                 mWordComposer.reset(true);
@@ -2488,6 +2898,15 @@ public final class InputLogic {
      */
     private void resetComposingState(final boolean alsoResetLastComposedWord) {
         mWordComposer.reset(alsoResetLastComposedWord);
+        // A reset of the composing state corresponds to a commit (user pressed space/separator,
+        // or an external action committed the word) or a full input reset — either way the
+        // gap-window must close so the next input starts a fresh window. But
+        // alsoResetLastComposedWord == false is used when merely STARTING a new word (the stock
+        // handleNonSeparatorEvent path), where the gap block has just opened the window for this
+        // tap and it must NOT be closed again.
+        if (alsoResetLastComposedWord) {
+            closeWordWindow();
+        }
         if (alsoResetLastComposedWord) {
             mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD;
         }
@@ -2644,18 +3063,53 @@ public final class InputLogic {
 
         rememberSuggestedWords(mConnection.getExpectedSelectionStart(), batchInputText, suggestedWords);
 
+        // Auto-space / word-window mode: when the window already contains a swipe/tap prefix (the
+        // EXTEND case), the decoded word spans taps + swipes and must stay composing without a
+        // PHANTOM space (no space inside a word). mWindowPointers holds the accumulated
+        // path; setBatchInputWord is safe here because we set the pointers FIRST (its reset() does
+        // not clear mInputPointers) so the accumulated path survives for the next extension.
+        final boolean windowDecoded = settingsValues.mWordInputGap > 0
+                && mWordWindowArbiter.isWindowOpen()
+                && (mWordComposer.isBatchMode() || mWindowPointers.getPointerSize() > 0);
+
         mConnection.beginBatchEdit();
-        if(distinct) mConnection.finishComposingText();
-        if (SpaceState.PHANTOM == mSpaceState) {
-            if(!mConnection.spacePrecedesComposingText())
-                insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues);
+        if (windowDecoded) {
+            // Window-decoded mode: the decoded word spans taps + swipes and is the latest
+            // re-decode of the still-open window. It must REPLACE the previous composing
+            // text, not commit it: finishComposingText() would commit the old decode ("Mi") as a
+            // separate word and then the new decode ("mir") would start right after it — "MiMir"
+            // instead of "mir".
+            // A phantom space is still materialized here when onStartBatchInput set it for a fresh
+            // swipe word following a letter/separator (e.g. a lazy-commit swipe-after-gap): that is
+            // the ONLY separator between the committed word and this new one. EXTEND re-decodes
+            // never have PHANTOM set (window words never set it), so no space appears inside a
+            // word, and spacePrecedesComposingText guards against double-spacing.
+            if (SpaceState.PHANTOM == mSpaceState) {
+                if(!mConnection.spacePrecedesComposingText())
+                    insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues);
+            }
+            mWordComposer.setBatchInputPointers(mWindowPointers);
+            // Also make the composer's typed word reflect the decoded word so isComposingWord()
+            // and getTypedWord() are correct for the lazy-commit / backspace paths. Unlike the
+            // stock branch, we set the pointers FIRST: setBatchInputWord's reset() does not touch
+            // mInputPointers, so the accumulated window path (taps as micro-swipes + swipes) is
+            // preserved for the next extension.
+            mWordComposer.setBatchInputWord(batchInputText);
+            setComposingTextInternal(batchInputText, 1);
+        } else {
+            if(distinct) mConnection.finishComposingText();
+            if (SpaceState.PHANTOM == mSpaceState) {
+                if(!mConnection.spacePrecedesComposingText())
+                    insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues);
+            }
+            mWordComposer.setBatchInputWord(batchInputText);
+            setComposingTextInternal(batchInputText, 1);
         }
-        mWordComposer.setBatchInputWord(batchInputText);
-        setComposingTextInternal(batchInputText, 1);
         mConnection.endBatchEdit();
         mConnection.send();
-        // Space state must be updated before calling updateShiftState
-        if(settingsValues.mAltSpacesMode != Settings.SPACES_MODE_NONE) mSpaceState = SpaceState.PHANTOM;
+        // Space state must be updated before calling updateShiftState. In window-decoded mode we
+        // are still mid-word: no PHANTOM space (it would insert a separator inside a word).
+        if(!windowDecoded && settingsValues.mAltSpacesMode != Settings.SPACES_MODE_NONE) mSpaceState = SpaceState.PHANTOM;
         keyboardSwitcher.requestUpdatingShiftState(getCurrentAutoCapsState(settingsValues));
 
         updateUiInputState();
@@ -2715,6 +3169,9 @@ public final class InputLogic {
         if(!ensureSuggestionStripCompleted(settingsValues, separator)) {
             mConnection.finishComposingText();
             mWordComposer.reset(true);
+            // The pending word is abandoned without going through commitChosenWord, so close the
+            // word-window here too (the next input must start a fresh window).
+            closeWordWindow();
             return false;
         }
 
@@ -2815,6 +3272,11 @@ public final class InputLogic {
         // strings.
         mLastComposedWord = mWordComposer.commitWord(commitType,
                 chosenWordWithSuggestions, separatorString, ngramContext);
+        // Close the word-window on every commit: a space/separator/manual-pick commit is a
+        // normal commit, so the next input must start a fresh window rather than extending the
+        // just-committed one (which would re-decode the stale accumulated path). The window-lazy
+        // COMMIT_THEN_START paths re-open the window afterwards via restartWindowForNewInput.
+        closeWordWindow();
         if (DebugFlags.DEBUG_ENABLED) {
             long runTimeMillis = System.currentTimeMillis() - startTimeMillis;
             Log.d(TAG, "commitChosenWord() : " + runTimeMillis + " ms to run "
@@ -2860,8 +3322,16 @@ public final class InputLogic {
     public void getSuggestedWords(final SettingsValues settingsValues,
             final Keyboard keyboard, final int keyboardShiftMode, final int inputStyle,
             final int sequenceNumber, final OnGetSuggestedWordsCallback callback) {
-        mWordComposer.adviseCapitalizedModeBeforeFetchingSuggestions(
-                getActualCapsMode(settingsValues, keyboardShiftMode));
+        // Auto-space / word-window mode: while a window is open, its caps mode was captured when
+        // the window's first input started (the first letter's shift state, or the first swipe's
+        // onStartBatchInput) and must be kept through every re-decode of that window. Re-advising
+        // from the current keyboard shift state here would clobber it: convertTypedPrefixToWindowPointers()
+        // momentarily empties the composer, and after the first letter auto-caps already flipped
+        // the keyboard to CAPS_MODE_OFF, so the advise would decode the word lowercase.
+        if (settingsValues.mWordInputGap <= 0 || !mWordWindowArbiter.isWindowOpen()) {
+            mWordComposer.adviseCapitalizedModeBeforeFetchingSuggestions(
+                    getActualCapsMode(settingsValues, keyboardShiftMode));
+        }
         mSuggest.getSuggestedWords(mWordComposer,
                 getNgramContextFromNthPreviousWordForSuggestion(
                         settingsValues.mSpacingAndPunctuations,
