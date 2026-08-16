@@ -1,0 +1,46 @@
+name: Build Release APK
+
+on:
+  push:
+    branches: ["*"]
+  workflow_dispatch:
+
+jobs:
+  build-release-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: Build release APK
+        env:
+          PYTHONUTF8: '1'
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: ${{ github.ref_name }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: ./gradlew assembleStableRelease --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-keyboard-stable-release
+          path: build/outputs/apk/stable/release/android-keyboard-stable-release.apk
+          if-no-files-found: error
