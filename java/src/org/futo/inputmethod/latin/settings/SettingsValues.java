@@ -117,6 +117,11 @@ public class SettingsValues {
     // Derived from Settings.PREF_WORD_COMBINE + Settings.PREF_WORD_INPUT_GAP. Consumed
     // synchronously by InputLogic/PointerTracker.
     public final int mWordInputGap;
+    // The auto-commit gap for pure-tap windows. 0 = pure-tap windows never auto-commit ("Enable
+    // auto-space when tapping" off); > 0 = a pure-tap window auto-commits once this doubled delay
+    // passes. Consumed only by WordWindowArbiter decisions; mWordInputGap still governs once the
+    // window contains a swipe.
+    public final int mWordTapInputGap;
 
     public final List<Locale> mMultilingualLocales;
 
@@ -231,12 +236,20 @@ public class SettingsValues {
                 prefs.getBoolean(Settings.PREF_WORD_COMBINE, Settings.DEFAULT_WORD_COMBINE);
         final boolean wordAutoSpace =
                 prefs.getBoolean(Settings.PREF_WORD_AUTO_SPACE, Settings.DEFAULT_WORD_AUTO_SPACE);
+        final boolean wordAutoSpaceTapping =
+                prefs.getBoolean(Settings.PREF_WORD_AUTO_SPACE_TAPPING,
+                        Settings.DEFAULT_WORD_AUTO_SPACE_TAPPING);
         final int wordAutoSpaceDelay =
                 prefs.getInt(Settings.PREF_WORD_INPUT_GAP, Settings.DEFAULT_WORD_INPUT_GAP);
         mWordInputGap = wordCombine
                 ? (wordAutoSpace
                         ? Math.max(wordAutoSpaceDelay, Settings.MIN_WORD_INPUT_GAP)
                         : Integer.MAX_VALUE)
+                : 0;
+        // Pure-tap auto-commit only makes sense while the window feature is active AND auto-space
+        // is on; the toggle then doubles the delay so slow tap typists aren't cut off mid-word.
+        mWordTapInputGap = wordCombine && wordAutoSpace && wordAutoSpaceTapping
+                ? Math.max(2 * wordAutoSpaceDelay, Settings.MIN_WORD_INPUT_GAP)
                 : 0;
 
         mShouldShowLxxSuggestionUi = Settings.SHOULD_SHOW_LXX_SUGGESTION_UI
@@ -608,6 +621,8 @@ public class SettingsValues {
         sb.append("" + mAltSpacesMode);
         sb.append("\n   mWordInputGap = ");
         sb.append("" + mWordInputGap);
+        sb.append("\n   mWordTapInputGap = ");
+        sb.append("" + mWordTapInputGap);
         sb.append("\n   mPlausibilityThreshold = ");
         sb.append("" + mPlausibilityThreshold);
         sb.append("\n   mAutoCorrectionEnabledPerTextFieldSettings = ");

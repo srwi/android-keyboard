@@ -277,6 +277,19 @@ val SwipeMenu = UserSettingsMenu(
             )
         },
 
+        userSettingToggleSharedPrefs(
+            title = R.string.swipe_settings_word_auto_space_tapping,
+            subtitle = R.string.swipe_settings_word_auto_space_tapping_subtitle,
+            key = Settings.PREF_WORD_AUTO_SPACE_TAPPING,
+            default = {false},
+        ).copy(
+            visibilityCheck = {
+                useSharedPrefsBool(Settings.PREF_WORD_COMBINE, false).value
+                        && useSharedPrefsBool(Settings.PREF_WORD_AUTO_SPACE, false).value
+            },
+            appearInSearchIfVisibilityCheckFailed = false
+        ),
+
         // KASROZ is primarily for English and the menu isn't translated, so it's hidden if user
         // doesn't have English layout
         UserSetting(R.string.swipe_settings_kasroz, subtitle = R.string.swipe_settings_kasroz_subtitle, visibilityCheck = {

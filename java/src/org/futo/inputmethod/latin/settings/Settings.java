@@ -169,6 +169,11 @@ public final class Settings implements SharedPreferences.OnSharedPreferenceChang
     public static final boolean DEFAULT_WORD_COMBINE = false;
     public static final String PREF_WORD_AUTO_SPACE = "pref_word_auto_space";
     public static final boolean DEFAULT_WORD_AUTO_SPACE = false;
+    // PREF_WORD_AUTO_SPACE_TAPPING extends auto-space to pure-tap words: when on, a pure-tap
+    // window also auto-commits once its doubled tap-gap passes instead of staying composing
+    // indefinitely (slow tap typists aren't cut off mid-word).
+    public static final String PREF_WORD_AUTO_SPACE_TAPPING = "pref_word_auto_space_tapping";
+    public static final boolean DEFAULT_WORD_AUTO_SPACE_TAPPING = false;
 
     // Emoji
     public static final String PREF_EMOJI_RECENT_KEYS = "emoji_recent_keys";

@@ -554,6 +554,9 @@
     <string name="swipe_settings_word_auto_space_delay">Auto-space delay</string>
     <string name="swipe_settings_word_auto_space_delay_subtitle">Commit the word when the next input starts after this time.</string>
 
+    <string name="swipe_settings_word_auto_space_tapping">Enable auto-space when tapping</string>
+    <string name="swipe_settings_word_auto_space_tapping_subtitle">Also commit tap-typed words after a pause, using double the auto-space delay above.</string>
+
     <string name="swipe_settings_kasroz">KASROZ</string>
     <string name="swipe_settings_kasroz_subtitle">The best keyboard layout to swipe</string>
 

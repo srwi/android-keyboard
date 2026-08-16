@@ -24,14 +24,17 @@ import android.os.SystemClock;
  *
  * <p>The arbiter is a small, dependency-light single-thread state holder (consumed on the IME
  * UI thread only). It is fed the wall-clock "now" of the new input and the previous input's
- * end time, plus the user-configured combine {@code gap} (ms; 0 = feature off ⇒ stock
- * behavior). Decision rules (in order):
+ * end time, plus the user-configured combine gaps in ms (the swipe gap and the tap gap; swipe
+ * gap {@code <= 0} = feature off ⇒ stock behavior). Decision rules (in order):
  * <ul>
- *   <li>{@code gap <= 0}: always {@link Decision#START_FRESH} and no state is mutated — the
+ *   <li>{@code swipeGap <= 0}: always {@link Decision#START_FRESH} and no state is mutated — the
  *       consumer keeps stock behavior and the arbiter stays inert.</li>
  *   <li>No open window: {@link Decision#START_FRESH} (and a new window is opened with this
  *       input as its first unit).</li>
- *   <li>Open window and the new input started within {@code gap} of the previous input's end:
+ *   <li>Pure-tap window with {@code tapGap <= 0} ("Enable auto-space when tapping" off):
+ *       always {@link Decision#EXTEND} — slow tapping never commits.</li>
+ *   <li>Open window and the new input started within the applicable gap (swipe gap once a swipe
+ *       is in the window, otherwise the tap gap) of the previous input's end:
  *       {@link Decision#EXTEND}.</li>
  *   <li>Open window and the new input started {@code >= gap} after the previous input's end:
  *       {@link Decision#COMMIT_THEN_START}. The pending word is not committed by silence: it
@@ -45,19 +48,19 @@ import android.os.SystemClock;
  * window, the consumer must feed the whole accumulated pointer path (taps as micro-swipes +
  * swipes) to the swipe decoder; until then, pure-tap windows append letters the stock way.
  *
- * <p><b>The gap timer arms only once a swipe is part of the word.</b> While a window is pure-tap
- * ({@link #windowHasSwipe()} is false), {@link #onStartInput} always returns
- * {@link Decision#EXTEND} — taps never start the timer, so typing slowly ("h a l") never commits
- * the word mid-typing. The timer reference ({@link #mLastInputEndTime}) is only maintained once
- * the window contains a swipe; from that point on the usual rules apply (within gap ⇒ extend,
- * past gap ⇒ {@link Decision#COMMIT_THEN_START}).
+ * <p><b>Two gaps.</b> The consumer supplies both a swipe gap (used once the window contains a
+ * completed swipe) and a tap gap (used while the window is still pure-tap). A tap gap of
+ * {@code <= 0} keeps the original behavior: pure-tap windows never arm the timer, so typing
+ * slowly ("h a l") never commits mid-word and the first swipe always extends a slow tap prefix.
+ * With a positive tap gap ("Enable auto-space when tapping"), the timer arms from the first input
+ * on, so a pure-tap word also auto-commits once the (doubled) tap gap passes.
  *
  * <p><b>Arming model.</b> {@link #windowHasSwipe()} flips to true only when a swipe actually
  * completes ({@link #recordInputEnd(long, boolean)} with {@code isSwipe == true}), never at swipe
- * start. This gives the invariant {@code windowHasSwipe() ⇒ mLastInputEndTime != NO_PREVIOUS}:
- * a has-swipe window always has an armed timer, so a cancelled swipe (whose
- * {@code recordInputEnd} is never called) naturally leaves the window pure-tap with no stale
- * timer, with no special revert logic.
+ * start. The timer reference is armed by every completed input that counts toward the window; a
+ * cancelled swipe (whose {@code recordInputEnd} is never called) therefore leaves no stale timer.
+ * Which gap applies to the next decision is read from {@link #windowHasSwipe()}: the swipe gap
+ * once any swipe has completed, the tap gap while the window is still pure-tap.
  *
  * <p>Consumer contract for {@link Decision#COMMIT_THEN_START}: the pending window's state
  * (including {@link #windowHasSwipe()}) stays observable so the consumer can pick the right
@@ -95,22 +98,25 @@ final class WordWindowArbiter {
     /**
      * Decide what the new input should do, measuring the gap against the arbiter's own clock.
      * Callers that already have a timestamp (e.g. a swipe's first down-event time) should use
-     * {@link #onStartInput(int, long, boolean)} instead.
+     * {@link #onStartInput(int, int, long, boolean)} instead.
      *
-     * @param gap combine gap in ms; {@code <= 0} ⇒ always {@link Decision#START_FRESH}.
+     * @param swipeGap combine gap in ms once the window contains a swipe; {@code <= 0} ⇒ always
+     *     {@link Decision#START_FRESH} (feature off).
+     * @param tapGap combine gap in ms while the window is pure-tap; {@code <= 0} ⇒ pure-tap
+     *     windows always {@link Decision#EXTEND} (auto-space while tapping off).
      * @param isSwipe true if the new input is a swipe; false if a tap.
      * @return the decision; never null.
      */
-    Decision onStartInput(final int gap, final boolean isSwipe) {
-        return onStartInput(gap, mClock.now(), isSwipe);
+    Decision onStartInput(final int swipeGap, final int tapGap, final boolean isSwipe) {
+        return onStartInput(swipeGap, tapGap, mClock.now(), isSwipe);
     }
 
     /**
      * Variant with an explicit "now" for callers that already have a timestamp they want to use
      * (e.g. the swipe's first down-event time, {@code BatchInputArbiter.sGestureFirstDownTime}).
      */
-    Decision onStartInput(final int gap, final long now, final boolean isSwipe) {
-        if (gap <= 0) {
+    Decision onStartInput(final int swipeGap, final int tapGap, final long now, final boolean isSwipe) {
+        if (swipeGap <= 0) {
             // Feature off: every input starts fresh. Do NOT mutate state so the arbiter stays
             // inert and stock behavior is byte-identical to the no-feature build.
             return Decision.START_FRESH;
@@ -120,16 +126,19 @@ final class WordWindowArbiter {
             mWindowOpen = true;
             return Decision.START_FRESH;
         }
-        if (!mWindowHasSwipe) {
-            // Pure-tap window so far: the timer has not been armed (it only arms once a swipe
-            // completes). Taps — and the first swipe — always extend: silence between taps never
-            // commits, no matter how slow the typing. Note we deliberately do NOT set hasSwipe
-            // here even for a swipe: it flips to true only when the swipe completes, so a
-            // cancelled first swipe never leaves a stale has-swipe state.
+        if (!mWindowHasSwipe && tapGap <= 0) {
+            // Pure-tap window with tap auto-commit off: always extend — slow typing never
+            // commits, and the first swipe extends a slow tap prefix no matter how late it
+            // starts.
             return Decision.EXTEND;
         }
-        // The window contains a completed swipe, so the timer is guaranteed armed (invariant:
-        // windowHasSwipe() ⇒ mLastInputEndTime != NO_PREVIOUS).
+        // The window has a completed swipe (swipe-gap rules) or a positive tap gap (tap-gap
+        // rules); in both cases the timer reference is armed from the previous input's end.
+        // Nothing to measure against only before the window's first input has completed.
+        if (mLastInputEndTime == NO_PREVIOUS) {
+            return Decision.EXTEND;
+        }
+        final int gap = mWindowHasSwipe ? swipeGap : tapGap;
         if ((now - mLastInputEndTime) < gap) {
             // Within the gap ⇒ this input extends the still-open window.
             return Decision.EXTEND;
@@ -151,8 +160,7 @@ final class WordWindowArbiter {
         mWindowOpen = true;
         mWindowHasSwipe = false;
         // Reset the timer reference: a fresh window starts unarmed. The consumer's
-        // recordInputEnd() re-arms it once an input completes AND that input is a swipe (which
-        // is also what flips hasSwipe back on).
+        // recordInputEnd() re-arms it once the new first input completes.
         mLastInputEndTime = NO_PREVIOUS;
     }
 
@@ -177,19 +185,18 @@ final class WordWindowArbiter {
      * </ul>
      * The consumer MUST call this once per input that should be counted toward the window.
      *
-     * <p>A completed swipe is what turns the window into a has-swipe window and arms the timer;
-     * taps only maintain the timer once the window already contains a swipe. A pure-tap window
-     * therefore never arms the timer — slow tapping never commits (the first swipe always
-     * extends a pure-tap prefix no matter how late it starts). A cancelled swipe never calls this
-     * method, so it leaves the window pure-tap with no stale timer.
+     * <p>A completed swipe is what turns the window into a has-swipe window; every completed
+     * input — tap or swipe — then arms the timer reference from its end time. In a pure-tap
+     * window that reference only drives a decision when the tap gap is positive
+     * ({@link #onStartInput} returns early for {@code tapGap <= 0}); with the tap gap off, slow
+     * tapping never commits and the first swipe always extends a slow tap prefix. A cancelled
+     * swipe never calls this method, so it leaves no stale timer.
      */
     void recordInputEnd(final long now, final boolean isSwipe) {
         if (isSwipe) {
             mWindowHasSwipe = true;
         }
-        if (mWindowHasSwipe) {
-            mLastInputEndTime = now;
-        }
+        mLastInputEndTime = now;
     }
 
     boolean isWindowOpen() {

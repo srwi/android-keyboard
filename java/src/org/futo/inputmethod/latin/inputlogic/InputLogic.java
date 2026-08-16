@@ -702,7 +702,9 @@ public final class InputLogic {
                 && settingsValues.isWordCodePoint(event.mCodePoint);
         if (isWordTap) {
             final long now = SystemClock.uptimeMillis();
-            final WordWindowArbiter.Decision d = mWordWindowArbiter.onStartInput(gap, now, false);
+            final WordWindowArbiter.Decision d =
+                    mWordWindowArbiter.onStartInput(gap, settingsValues.mWordTapInputGap, now,
+                            false);
             if (d == WordWindowArbiter.Decision.COMMIT_THEN_START) {
                 // Gap exceeded: the pending window word commits lazily on this, the next tap,
                 // with one space honoring auto-space mode, then this tap begins a fresh word the
@@ -737,8 +739,9 @@ public final class InputLogic {
                 commitPendingWindowAndStartFreshTap(settingsValues);
             } else {
                 // START_FRESH or pure-tap EXTEND: stock path handles the tap (letter append).
-                // Note: while the window is pure-tap, recordInputEnd is a no-op (the gap timer
-                // only arms once a swipe is part of the word), so slow taps never commit.
+                // recordInputEnd arms the timer reference; while the window is pure-tap it only
+                // drives a decision when "Enable auto-space when tapping" is on (mWordTapInputGap
+                // > 0) — otherwise the arbiter ignores it and slow taps never commit.
                 mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */);
             }
         }
@@ -771,8 +774,9 @@ public final class InputLogic {
 
         mLastKeyTime = inputTransaction.mTimestamp;
         // Record the gap-window's input-end reference for the stock fall-through tap path (the
-        // gap-aware early branch above records its own). Only meaningful when gap > 0; no-op for
-        // pure-tap windows (the timer only arms once a swipe is part of the word).
+        // gap-aware early branch above records its own). Only meaningful when gap > 0; the timer
+        // reference only drives decisions in a pure-tap window when "Enable auto-space when
+        // tapping" is on (otherwise the arbiter ignores it for pure-tap windows).
         if (gap > 0) {
             mWordWindowArbiter.recordInputEnd(inputTransaction.mTimestamp, false /* isSwipe */);
         }
@@ -1086,7 +1090,8 @@ public final class InputLogic {
             final long swipeDownTime = BatchInputArbiter.getGestureFirstDownTime();
             final long now = swipeDownTime > 0 ? swipeDownTime : SystemClock.uptimeMillis();
             final WordWindowArbiter.Decision d =
-                    mWordWindowArbiter.onStartInput(settingsValues.mWordInputGap, now, true);
+                    mWordWindowArbiter.onStartInput(settingsValues.mWordInputGap,
+                            settingsValues.mWordTapInputGap, now, true);
             if (d == WordWindowArbiter.Decision.EXTEND) {
                 // This swipe extends the still-open window (the whole window decodes as one
                 // unit). Defer the prefix→micro-swipe conversion to onEndBatchInput so a
