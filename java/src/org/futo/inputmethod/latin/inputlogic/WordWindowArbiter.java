@@ -75,9 +75,27 @@ final class WordWindowArbiter {
     /** Sentinel for "no previous input yet". */
     private static final long NO_PREVIOUS = -1L;
 
+    /** Sentinel for "no combine-gap timer is armed". */
+    private static final long NO_TIMER = -1L;
+
     private long mLastInputEndTime = NO_PREVIOUS;
     private boolean mWindowOpen = false;
     private boolean mWindowHasSwipe = false;
+
+    /**
+     * When the current window's combine-gap timer expires, or {@link #NO_TIMER} if no timer is
+     * armed. Updated by every completed input ({@link #recordInputEnd(long, boolean, int, int)})
+     * and cleared when the window is reset. Purely a UI hint for the auto-space countdown line:
+     * it never affects any decision, and the word still commits lazily on the next input.
+     */
+    private long mTimerDeadline = NO_TIMER;
+
+    private TimerListener mTimerListener;
+
+    /** Receives the wall-clock deadline whenever the armed combine-gap timer changes. */
+    interface TimerListener {
+        void onTimerDeadlineChanged(long deadline);
+    }
 
     private final LongSupplier mClock;
 
@@ -122,8 +140,11 @@ final class WordWindowArbiter {
             return Decision.START_FRESH;
         }
         if (!mWindowOpen) {
-            // First input of a new window — open it with this input as its first unit.
+            // First input of a new window — open it with this input as its first unit. No
+            // completed input yet, so nothing is armed: the UI countdown stays hidden until the
+            // input completes and {@link #recordInputEnd(long, boolean, int, int)} re-arms it.
             mWindowOpen = true;
+            setTimerDeadline(NO_TIMER);
             return Decision.START_FRESH;
         }
         if (!mWindowHasSwipe && tapGap <= 0) {
@@ -162,6 +183,7 @@ final class WordWindowArbiter {
         // Reset the timer reference: a fresh window starts unarmed. The consumer's
         // recordInputEnd() re-arms it once the new first input completes.
         mLastInputEndTime = NO_PREVIOUS;
+        setTimerDeadline(NO_TIMER);
     }
 
     /**
@@ -173,6 +195,7 @@ final class WordWindowArbiter {
         mWindowOpen = false;
         mWindowHasSwipe = false;
         mLastInputEndTime = NO_PREVIOUS;
+        setTimerDeadline(NO_TIMER);
     }
 
     /**
@@ -197,6 +220,52 @@ final class WordWindowArbiter {
             mWindowHasSwipe = true;
         }
         mLastInputEndTime = now;
+    }
+
+    /**
+     * {@link #recordInputEnd(long, boolean)} plus re-arming the combine-gap timer from this
+     * input's end time. Which gap applies mirrors {@link #onStartInput}'s choice exactly: the
+     * swipe gap once the window contains a swipe, otherwise the tap gap. A {@code <= 0} gap
+     * (feature/tapping-auto-space off) or a window with no completed input leaves the timer
+     * unarmed, matching the arbiter's decision rules.
+     */
+    void recordInputEnd(final long now, final boolean isSwipe, final int swipeGap, final int tapGap) {
+        recordInputEnd(now, isSwipe);
+        rearmTimer(swipeGap, tapGap);
+    }
+
+    void setTimerListener(final TimerListener listener) {
+        mTimerListener = listener;
+    }
+
+    /**
+     * Wall-clock deadline (in the arbiter's clock) when the current window's combine-gap timer
+     * expires, or {@code -1} if no timer is armed. Only a UI hint; the word still commits lazily
+     * on the next input.
+     */
+    long getTimerDeadline() {
+        return mTimerDeadline;
+    }
+
+    private void rearmTimer(final int swipeGap, final int tapGap) {
+        if (!mWindowOpen || mLastInputEndTime == NO_PREVIOUS) {
+            setTimerDeadline(NO_TIMER);
+            return;
+        }
+        if (mWindowHasSwipe) {
+            setTimerDeadline(swipeGap > 0 ? mLastInputEndTime + swipeGap : NO_TIMER);
+        } else {
+            setTimerDeadline(tapGap > 0 ? mLastInputEndTime + tapGap : NO_TIMER);
+        }
+    }
+
+    private void setTimerDeadline(final long deadline) {
+        if (deadline != mTimerDeadline) {
+            mTimerDeadline = deadline;
+            if (mTimerListener != null) {
+                mTimerListener.onTimerDeadlineChanged(deadline);
+            }
+        }
     }
 
     boolean isWindowOpen() {

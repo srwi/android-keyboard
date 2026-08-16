@@ -329,4 +329,83 @@ public class WordWindowArbiterTests {
         clock.t = 2000L;
         assertEquals(WordWindowArbiter.Decision.COMMIT_THEN_START, a.onStartInput(200, 400, false));
     }
+
+    // --- Combine-gap timer deadline (UI countdown hint) ---
+
+    @Test
+    public void testTimerDeadlineUnarmedByDefaultAndAfterReset() {
+        final WordWindowArbiter a = newArbiter(1000L);
+        assertEquals(-1L, a.getTimerDeadline());
+        a.onStartInput(200, 0, false);                       // opens window, no input done
+        assertEquals(-1L, a.getTimerDeadline());
+        a.onWindowReset();
+        assertEquals(-1L, a.getTimerDeadline());
+    }
+
+    @Test
+    public void testTimerDeadlineUsesTapGapForPureTapWindow() {
+        final WordWindowArbiter a = newArbiter(1000L);
+        a.onStartInput(200, 400, false);                     // opens pure-tap window
+        a.recordInputEnd(1000L, false, 200, 400);
+        assertEquals(1400L, a.getTimerDeadline());           // now + tapGap
+        // Re-armed by the next completed tap within the gap.
+        a.onStartInput(200, 400, false);                     // EXTEND
+        a.recordInputEnd(1200L, false, 200, 400);
+        assertEquals(1600L, a.getTimerDeadline());
+    }
+
+    @Test
+    public void testTimerDeadlineUsesSwipeGapOnceWindowHasSwipe() {
+        final WordWindowArbiter a = newArbiter(1000L);
+        a.onStartInput(200, 400, true);                      // swipe, opens window
+        a.recordInputEnd(1000L, true, 200, 400);
+        assertEquals(1200L, a.getTimerDeadline());           // now + swipeGap, not tapGap
+    }
+
+    @Test
+    public void testTimerDeadlineNotArmedWhenTapAutoSpaceOff() {
+        final WordWindowArbiter a = newArbiter(1000L);
+        // Pure-tap window with tapGap == 0 ("Enable auto-space when tapping" off) never arms.
+        a.onStartInput(200, 0, false);
+        a.recordInputEnd(1000L, false, 200, 0);
+        assertEquals(-1L, a.getTimerDeadline());
+        // Feature off (swipeGap == 0) keeps the arbiter inert: no deadline.
+        final WordWindowArbiter b = newArbiter(1000L);
+        b.onStartInput(0, 0, false);
+        b.recordInputEnd(1000L, false, 0, 0);
+        assertEquals(-1L, b.getTimerDeadline());
+    }
+
+    @Test
+    public void testTimerDeadlineClearedByWindowResetAndRestart() {
+        final FakeClock clock = new FakeClock(1000L);
+        final WordWindowArbiter a = new WordWindowArbiter(clock);
+        a.onStartInput(200, 400, true);
+        a.recordInputEnd(1000L, true, 200, 400);
+        assertEquals(1200L, a.getTimerDeadline());
+        a.onWindowReset();
+        assertEquals(-1L, a.getTimerDeadline());
+        // A restart (post-commit) also un-arms until the new first input completes.
+        a.onStartInput(200, 400, false);
+        a.restartWindowForNewInput();
+        assertEquals(-1L, a.getTimerDeadline());
+    }
+
+    @Test
+    public void testTimerListenerNotifiedOnDeadlineChanges() {
+        final FakeClock clock = new FakeClock(1000L);
+        final WordWindowArbiter a = new WordWindowArbiter(clock);
+        final long[] received = { -99L };
+        a.setTimerListener(deadline -> received[0] = deadline);
+
+        a.onStartInput(200, 400, true);                      // opens window, no deadline yet
+        a.recordInputEnd(1000L, true, 200, 400);
+        assertEquals(1200L, received[0]);
+        a.onWindowReset();
+        assertEquals(-1L, received[0]);
+        // Re-arming to a different value fires again.
+        a.onStartInput(200, 400, true);
+        a.recordInputEnd(1500L, true, 200, 400);
+        assertEquals(1700L, received[0]);
+    }
 }

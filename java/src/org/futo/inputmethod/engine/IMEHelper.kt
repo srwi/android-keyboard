@@ -60,6 +60,11 @@ class IMEHelper(
         latinIME.uixManager.onInputEvent(textEmpty)
     }
 
+    /** Called by InputLogic whenever the word-window combine-gap timer is (re)armed or disarmed. */
+    public fun updateWordWindowTimer(deadline: Long) {
+        latinIME.uixManager.onWordWindowTimerChanged(deadline)
+    }
+
     public fun getCodepointCoordinates(codePoints: IntArray): IntArray {
         return latinIME.latinIMELegacy.getCoordinatesForCurrentKeyboard(codePoints)
     }

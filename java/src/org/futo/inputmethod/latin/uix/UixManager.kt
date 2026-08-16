@@ -614,6 +614,13 @@ class UixManager(private val latinIME: LatinIME) {
 
     private var inlineStuffHiddenByTyping = mutableStateOf(false)
 
+    private val wordWindowTimerDeadline = mutableStateOf(-1L)
+
+    /** Called by InputLogic whenever the word-window combine-gap timer is (re)armed or disarmed. */
+    fun onWordWindowTimerChanged(deadline: Long) {
+        wordWindowTimerDeadline.value = deadline
+    }
+
     private var isActionsExpanded = mutableStateOf(false)
     private fun toggleActionsExpanded() {
         isActionsExpanded.value = !isActionsExpanded.value
@@ -737,7 +744,8 @@ class UixManager(private val latinIME: LatinIME) {
                     },
                     onQuickClipDismiss = { quickClipState.value = null },
                     needToUseExpandableSuggestionUi = needToUseExpandableSuggestionUi,
-                    loading = latinIME.imeManager.isImeLoading()
+                    loading = latinIME.imeManager.isImeLoading(),
+                    wordWindowTimerDeadline = wordWindowTimerDeadline.value
                 )
             }
         }

@@ -257,6 +257,11 @@ public final class InputLogic {
         mDictionaryFacilitator = dictionaryFacilitator;
         mImeHelper = imeHelper;
         mIme = ime;
+        // Surface the combine-gap timer's wall-clock deadline to the UI so the action bar can
+        // draw the auto-space countdown line. The arbiter only changes the deadline on main
+        // thread (input handling), matching where IMEHelper forwards it.
+        mWordWindowArbiter.setTimerListener(deadline ->
+                mImeHelper.updateWordWindowTimer(deadline));
     }
 
     private int numCursorUpdatesSinceInputStarted = 0;
@@ -721,7 +726,8 @@ public final class InputLogic {
                 if (x != Constants.NOT_A_COORDINATE && y != Constants.NOT_A_COORDINATE) {
                     appendTapMicroSwipeToWindow(x, y);
                     triggerWindowRedecode();
-                    mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */);
+                    mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */, gap,
+                            settingsValues.mWordTapInputGap);
                     final InputTransaction it = new InputTransaction(settingsValues, event, now,
                             mSpaceState, getActualCapsMode(settingsValues, keyboardShiftMode));
                     mLastKeyTime = now;
@@ -742,7 +748,8 @@ public final class InputLogic {
                 // recordInputEnd arms the timer reference; while the window is pure-tap it only
                 // drives a decision when "Enable auto-space when tapping" is on (mWordTapInputGap
                 // > 0) — otherwise the arbiter ignores it and slow taps never commit.
-                mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */);
+                mWordWindowArbiter.recordInputEnd(now, false /* isSwipe */, gap,
+                        settingsValues.mWordTapInputGap);
             }
         }
 
@@ -778,7 +785,8 @@ public final class InputLogic {
         // reference only drives decisions in a pure-tap window when "Enable auto-space when
         // tapping" is on (otherwise the arbiter ignores it for pure-tap windows).
         if (gap > 0) {
-            mWordWindowArbiter.recordInputEnd(inputTransaction.mTimestamp, false /* isSwipe */);
+            mWordWindowArbiter.recordInputEnd(inputTransaction.mTimestamp, false /* isSwipe */,
+                    gap, settingsValues.mWordTapInputGap);
         }
         mConnection.beginBatchEdit();
         if (!mWordComposer.isComposingWord()) {
@@ -1222,7 +1230,8 @@ public final class InputLogic {
             mInputLogicHandler.updateTailBatchInput(batchPointers, mAutoCommitSequenceNumber);
         }
         mWindowExtendingSwipe = false;
-        mWordWindowArbiter.recordInputEnd(SystemClock.uptimeMillis(), true /* isSwipe */);
+        mWordWindowArbiter.recordInputEnd(SystemClock.uptimeMillis(), true /* isSwipe */,
+                settingsValues.mWordInputGap, settingsValues.mWordTapInputGap);
         ++mAutoCommitSequenceNumber;
     }
 

@@ -3,10 +3,14 @@ package org.futo.inputmethod.latin.uix
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import androidx.annotation.RequiresApi
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -70,6 +74,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -825,6 +830,7 @@ fun ActionBar(
     onQuickClipDismiss: () -> Unit = {},
     needToUseExpandableSuggestionUi: Boolean = false,
     loading: Boolean = false,
+    wordWindowTimerDeadline: Long = -1L,
 ) {
     val view = LocalView.current
     val context = LocalContext.current
@@ -847,6 +853,8 @@ fun ActionBar(
             testTag = "ActionBar"
             testTagsAsResourceId = true
         }) {
+        WordWindowTimerIndicator(wordWindowTimerDeadline)
+
         if(isActionsExpanded && !oldActionBar.value) {
             ActionSep()
 
@@ -932,6 +940,46 @@ fun ActionBar(
 
         ActionSep(true)
     }
+}
+
+@Composable
+fun WordWindowTimerIndicator(
+    deadline: Long,
+    modifier: Modifier = Modifier
+) {
+    val remainingMs = deadline - SystemClock.uptimeMillis()
+    if (remainingMs <= 0) return
+
+    val fraction = remember(deadline) {
+        Animatable(1f)
+    }
+
+    LaunchedEffect(deadline) {
+        fraction.snapTo(1f)
+        fraction.animateTo(
+            targetValue = 0f,
+            animationSpec = tween(
+                durationMillis = remainingMs.toInt(),
+                easing = LinearEasing
+            )
+        )
+    }
+
+    val color = LocalKeyboardScheme.current.primary
+
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(2.dp)
+            .drawBehind {
+                val lineWidth = size.width * fraction.value
+                drawRect(
+                    color = color,
+                    topLeft = Offset((size.width - lineWidth) / 2f, 0f),
+                    size = Size(lineWidth, size.height)
+                )
+            }
+    )
 }
 
 @Composable
